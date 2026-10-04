@@ -1,0 +1,451 @@
+##########################################################################################
+##########################Snakemaker #####################################################
+rnaseq_project/
+├── Snakefile
+├── config/
+│   └── config.yaml
+├── data/
+│   ├── sample1_R1.fastq.gz
+│   ├── sample1_R2.fastq.gz
+│   ├── sample2_R1.fastq.gz
+│   └── sample2_R2.fastq.gz
+├── containers/
+│   └── fastqc.sif
+├── scripts/
+├── slurm/
+│   └── run_rnaseq.sbatch
+├── logs/
+└── results/
+
+#### configfile: "config/config.yaml"
+
+SAMPLES = config["samples"]
+DATA = config["data_dir"]
+RESULTS = config["results_dir"]
+
+rule all:
+    input:
+        expand(
+            RESULTS + "/{sample}_R1_fastqc.html",
+            sample=SAMPLES
+        ),
+        expand(
+            RESULTS + "/{sample}_R2_fastqc.html",
+            sample=SAMPLES
+        )
+
+rule fastqc:
+    input:
+        r1=DATA + "/{sample}_R1.fastq.gz",
+        r2=DATA + "/{sample}_R2.fastq.gz"
+    output:
+        html1=RESULTS + "/{sample}_R1_fastqc.html",
+        html2=RESULTS + "/{sample}_R2_fastqc.html",
+        zip1=RESULTS + "/{sample}_R1_fastqc.zip",
+        zip2=RESULTS + "/{sample}_R2_fastqc.zip"
+    log:
+        "logs/{sample}_fastqc.log"
+    threads:
+        config["threads"]
+    resources:
+        mem_mb=config["memory_mb"]
+    params:
+        container="containers/fastqc.sif"
+    shell:
+        """
+        apptainer exec \
+            --bind "$PWD:$PWD" \
+            --pwd "$PWD" \
+            {params.container} \
+            fastqc \
+                --threads {threads} \
+                --outdir {RESULTS} \
+                {input.r1} {input.r2} \
+                > {log} 2>&1
+        """
+
+########################
+file 2: slurm/run_rnaseq.sbatch
+########################
+#!/bin/bash
+
+#SBATCH --job-name=rnaseq
+#SBATCH --partition=compute
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/rnaseq_%j.out
+#SBATCH --error=logs/rnaseq_%j.err
+
+set -euo pipefail
+
+# Project directory
+PROJECT_DIR="/project/labname/gli99/rnaseq_project"
+
+# Scratch working directory
+SCRATCH_DIR="/scratch/gli99/rnaseq_work/${SLURM_JOB_ID}"
+
+# Move to project directory
+cd "$PROJECT_DIR"
+
+# Create a temporary working directory
+mkdir -p "$SCRATCH_DIR"
+
+# Load the environment
+module purge
+module load Apptainer
+module load Miniforge3
+
+# Activate Snakemake environment
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate rnaseq
+
+# Record job metadata
+echo "Job ID: ${SLURM_JOB_ID}"
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+echo "CPUs: ${SLURM_CPUS_PER_TASK}"
+echo "Memory: 16G"
+
+# Stage input data to scratch
+cp data/*.fastq.gz "$SCRATCH_DIR/"
+
+# Stage workflow and container
+cp Snakefile "$SCRATCH_DIR/"
+cp -r config scripts "$SCRATCH_DIR/"
+cp containers/fastqc.sif "$SCRATCH_DIR/"
+
+# Run Snakemake in scratch
+cd "$SCRATCH_DIR"
+
+mkdir -p results logs
+
+snakemake \
+    --snakefile Snakefile \
+    --configfile config/config.yaml \
+    --cores "$SLURM_CPUS_PER_TASK" \
+    --printshellcmds \
+    --rerun-incomplete \
+    --latency-wait 60
+
+# Copy results back to persistent project storage
+mkdir -p "$PROJECT_DIR/results/${SLURM_JOB_ID}"
+
+rsync -avh \
+    results/ \
+    "$PROJECT_DIR/results/${SLURM_JOB_ID}/"
+
+# Preserve logs
+rsync -avh \
+    logs/ \
+    "$PROJECT_DIR/logs/"
+
+echo "Completed: $(date)"
+
+#######################################
+
+############################################################################
+## Advanced mode: let Snakemake submit individual jobs to SLURM
+#############################################################################
+# In the previous example, one SLURM job reserves eight CPUs and runs all Snakemake rules within that allocation. 
+# On a multi-node cluster, a more scalable approach is to have Snakemake submit individual rules to SLURM, 
+# allowing independent samples or pipeline stages to run concurrently across compute nodes.
+############################################################################
+Step 17. Add resource requirements to your Snakefile
+
+For example:
+
+rule fastqc:
+    input:
+        r1="data/{sample}_R1.fastq.gz",
+        r2="data/{sample}_R2.fastq.gz"
+    output:
+        html1="results/{sample}_R1_fastqc.html",
+        html2="results/{sample}_R2_fastqc.html",
+        zip1="results/{sample}_R1_fastqc.zip",
+        zip2="results/{sample}_R2_fastqc.zip"
+    log:
+        "logs/{sample}_fastqc.log"
+    threads: 4
+    resources:
+        mem_mb=4000,
+        runtime=60
+    shell:
+        """
+        apptainer exec \
+            --bind "$PWD:$PWD" \
+            --pwd "$PWD" \
+            containers/fastqc.sif \
+            fastqc \
+                --threads {threads} \
+                --outdir results \
+                {input.r1} {input.r2} \
+                > {log} 2>&1
+        """
+
+The rule specifies four threads, 4 GB of memory and a runtime estimate. The executor translates these requirements into scheduler submissions according to its configuration.
+
+Step 18. Create a SLURM submission script for the workflow controller
+
+Create slurm/submit_snakemake.sbatch:
+
+#!/bin/bash
+
+#SBATCH --job-name=snakemake_ctl
+#SBATCH --partition=compute
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --time=02:00:00
+#SBATCH --output=logs/controller_%j.out
+#SBATCH --error=logs/controller_%j.err
+
+set -euo pipefail
+
+PROJECT_DIR="/project/labname/gli99/rnaseq_project"
+
+cd "$PROJECT_DIR"
+
+module purge
+module load Miniforge3
+module load Apptainer
+
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate rnaseq
+
+echo "Snakemake controller job: $SLURM_JOB_ID"
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+
+snakemake \
+    --snakefile Snakefile \
+    --configfile config/config.yaml \
+    --profile profiles/slurm \
+    --cores 100 \
+    --resources mem_mb=64000 \
+    --printshellcmds
+
+echo "Workflow controller finished: $(date)"
+
+Here, the controller job reserves one CPU and 4 GB of RAM. Snakemake submits the actual analysis rules as separate SLURM jobs.
+
+The --cores and global resource settings are workflow-level submission limits; they should be tuned to your cluster's quotas, partition policies and the resources required by the workflow. The controller must also be allowed to submit and monitor jobs for the duration of the workflow.
+
+Submit the controller:
+
+sbatch slurm/submit_snakemake.sbatch
+
+
+
+
+
+
+
+
+############################################################################################
+################################################ Next FLOW #################################
+############################################################################################
+rna-seq-pipeline/
+├── main.nf
+├── nextflow.config
+├── conf/
+│   └── slurm.config
+├── slurm/
+│   └── run_rnaseq.sbatch
+├── data/
+├── results/
+└── logs/
+
+##  file 1: slurm/run_rnaseq.sbatch
+#!/bin/bash
+#SBATCH --job-name=rnaseq_nf
+#SBATCH --partition=compute
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=8G
+#SBATCH --time=02:00:00
+#SBATCH --output=logs/nextflow_%j.out
+#SBATCH --error=logs/nextflow_%j.err
+
+set -euo pipefail
+
+echo "========================================"
+echo "RNA-seq Nextflow Pipeline"
+echo "Job ID:      $SLURM_JOB_ID"
+echo "Node:        $(hostname)"
+echo "Start time:  $(date)"
+echo "========================================"
+
+# -----------------------------
+# 1. Load software
+# -----------------------------
+
+module load Nextflow
+module load Java
+
+# If your HPC uses Apptainer:
+module load Apptainer
+
+nextflow -version
+java -version
+
+# -----------------------------
+# 2. Define directories
+# -----------------------------
+
+PROJECT=$HOME/rna-seq-pipeline
+WORK=$SCRATCH/rnaseq_nf_${SLURM_JOB_ID}
+RESULTS=$PROJECT/results
+
+mkdir -p "$WORK"
+mkdir -p "$RESULTS"
+mkdir -p "$PROJECT/logs"
+
+cd "$PROJECT"
+
+echo "Project: $PROJECT"
+echo "Work:    $WORK"
+echo "Results: $RESULTS"
+
+# -----------------------------
+# 3. Run Nextflow
+# -----------------------------
+
+nextflow run main.nf \
+    -c conf/slurm.config \
+    --reads "$PROJECT/data/*_{R1,R2}.fastq.gz" \
+    --outdir "$RESULTS" \
+    -work-dir "$WORK" \
+    -resume
+
+# -----------------------------
+# 4. Save execution information
+# -----------------------------
+
+echo "========================================"
+echo "Pipeline finished"
+echo "End time: $(date)"
+echo "========================================"
+
+nextflow log
+
+# -----------------------------
+# 5. Clean temporary work
+# -----------------------------
+
+rm -rf "$WORK"
+
+echo "Temporary work directory removed."
+
+#######################################
+## file 2:  conf/slurm.config
+#######################################
+process {
+    executor = 'slurm'
+
+    queue = 'compute'
+
+    cpus = 2
+    memory = '8 GB'
+    time = '2h'
+
+    errorStrategy = 'retry'
+    maxRetries = 2
+
+    withLabel: 'fastqc' {
+        cpus = 2
+        memory = '4 GB'
+        time = '1h'
+    }
+
+    withLabel: 'star' {
+        cpus = 8
+        memory = '32 GB'
+        time = '8h'
+    }
+
+    withLabel: 'featurecounts' {
+        cpus = 4
+        memory = '16 GB'
+        time = '2h'
+    }
+}
+
+executor {
+    name = 'slurm'
+}
+
+singularity {
+    enabled = true
+    autoMounts = true
+}
+
+##########################################
+### next flow file 3: main.nf ############
+nextflow.enable.dsl=2
+
+params.reads  = "$baseDir/data/*_{R1,R2}.fastq.gz"
+params.outdir = "$baseDir/results"
+
+process FASTQC {
+
+    tag "$sample_id"
+
+    label 'fastqc'
+
+    input:
+    tuple val(sample_id), path(reads)
+
+    output:
+    path "fastqc"
+
+    script:
+    """
+    mkdir -p fastqc
+
+    fastqc \
+        -t ${task.cpus} \
+        -o fastqc \
+        ${reads}
+    """
+}
+
+process STAR {
+
+    tag "$sample_id"
+
+    label 'star'
+
+    input:
+    tuple val(sample_id), path(reads)
+
+    output:
+    path "${sample_id}.bam"
+
+    script:
+    """
+    STAR \
+        --runThreadN ${task.cpus} \
+        --readFilesIn ${reads[0]} ${reads[1]} \
+        --readFilesCommand zcat \
+        --outSAMtype BAM SortedByCoordinate \
+        --outFileNamePrefix ${sample_id}.
+    """
+}
+
+workflow {
+
+    reads_ch = Channel
+        .fromFilePairs(
+            params.reads,
+            checkIfExists: true
+        )
+
+    FASTQC(reads_ch)
+
+    STAR(reads_ch)
+}
+
+
